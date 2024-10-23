@@ -1,0 +1,11 @@
+text-extract-ocr:
+  image: "r8.im/abiruyt/text-extract-ocr"
+  use_gpu: false
+  health_check:
+    mode: "http"
+    url: "health-check"
+    regex: "READY"
+  ports:
+    - 5000
+  environment:
+    var: "value"

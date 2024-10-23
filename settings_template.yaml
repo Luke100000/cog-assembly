@@ -1,0 +1,9 @@
+# The time between updates (container shutdowns, VRAM health checks, config reloads, ...)
+update_interval: 5
+
+users:
+  - name: default
+    token: anonymous
+    can_cold_start: true
+    can_access_logs: true
+    whitelist:

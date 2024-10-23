@@ -1,5 +1,6 @@
 import socket
 from dataclasses import dataclass
+from typing import Union
 
 import psutil
 import pynvml
@@ -94,3 +95,26 @@ def find_unused_port(start_port: int = 1024, end_port: int = 65535) -> int:
             if s.connect_ex(("localhost", port)) != 0:
                 return port
     raise RuntimeError("No unused ports available in the specified range.")
+
+
+def convert_to_int(size_str: Union[str, int]) -> int:
+    units = {
+        "k": 10**3,
+        "K": 10**3,
+        "m": 10**6,
+        "M": 10**6,
+        "g": 10**9,
+        "G": 10**9,
+        "t": 10**12,
+        "T": 10**12,
+        "Ki": 2**10,
+        "Mi": 2**20,
+        "Gi": 2**30,
+    }
+    if isinstance(size_str, int):
+        return size_str
+    if size_str[-2:] in units:
+        return int(float(size_str[:-2]) * units[size_str[-2:]])
+    elif size_str[-1] in units:
+        return int(float(size_str[:-1]) * units[size_str[-1]])
+    return int(size_str)

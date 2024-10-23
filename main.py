@@ -14,7 +14,7 @@ from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from starlette.responses import PlainTextResponse
 
-from cog_asembly.manager import ServiceManager
+from cog_asembly.manager import ServiceManager, ServiceStatus
 from cog_asembly.metrics import start_metrics
 from cog_asembly.utils import (
     get_system_ram,
@@ -62,7 +62,7 @@ def proxy_request(
     service.connections += 1
     service.last_activity = time.time()
 
-    manager.start_container(name)
+    manager.start_service(name)
 
     try:
         # Forward the request
@@ -113,12 +113,19 @@ def stats():
     return PlainTextResponse(
         "\n".join(
             [
-                f"System RAM: {humanize.naturalsize(ram['used'])} of {humanize.naturalsize(ram['total'])} used ({ram['used'] / ram['total']:.2%}).",
+                f"System RAM: {humanize.naturalsize(ram.used)} of {humanize.naturalsize(ram.total)} used ({ram.used / ram.total:.1%}), {manager.allocated_memory(-1) / ram.total:.1%} allocated to services.",
                 *[
-                    f"GPU {gpu}: {humanize.naturalsize(vram['used'])} of {humanize.naturalsize(vram['total'])} used ({vram['used'] / vram['total']:.2%})."
+                    f"GPU {gpu}: {humanize.naturalsize(vram.used)} of {humanize.naturalsize(vram.total)} used ({vram.used / vram.total:.1%}), {manager.allocated_memory(gpu) / vram.total:.1%} allocated to services."
                     for gpu, vram in get_system_vram().items()
                 ],
-                f"{sum([1 for service in manager.services.values() if service.running])} of {len(manager.services)} services running.",
+                "",
+                f"{sum([1 for service in manager.services.values() if service.status == ServiceStatus.RUNNING])} of {len(manager.services)} services running:",
+                *[
+                    f"- {service.name}: {service.status.value}, {humanize.naturalsize(service.ram)} RAM, {humanize.naturalsize(service.vram)} VRAM, {service.connections} connections"
+                    if service.status != ServiceStatus.STOPPED
+                    else f"- {service.name}: {service.status.value}"
+                    for service in manager.services.values()
+                ],
             ],
         )
     )

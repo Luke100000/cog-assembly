@@ -7,15 +7,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any, Union
 
 import docker
 import docker.errors
+import humanize
 import requests
 import yaml
 from dacite import from_dict, Config
 from docker.models.containers import Container
-from docker.types import DeviceRequest
+from docker.types import DeviceRequest, Mount
 
 from cog_asembly.utils import (
     get_process_ram,
@@ -24,6 +25,7 @@ from cog_asembly.utils import (
     find_unused_port,
     get_system_ram,
     get_system_vram,
+    convert_to_int,
 )
 
 
@@ -61,23 +63,39 @@ class HealthCheckConfig:
 
 
 @dataclass
-class ContainerConfig:
+class MountConfig:
+    target: str
+    source: str
+    type: str = "volume"
+    read_only: bool = False
+    consistency: Optional[str] = None
+    propagation: Optional[str] = None
+    no_copy: bool = False
+    labels: Optional[Dict[str, Any]] = None
+    driver_config: Optional[Any] = None
+    tmpfs_size: Optional[Union[int, str]] = None
+    tmpfs_mode: Optional[int] = None
+
+
+@dataclass
+class ServiceConfig:
     image: str
+    public: bool = True
 
     max_vram: Optional[str] = None
     max_ram: Optional[str] = None
-    reserve_vram: Optional[str] = None
-    reserve_ram: Optional[str] = None
 
-    recommends_gpu: bool = True
-    requires_gpu: bool = False
+    use_gpu: bool = True
+    use_cpu: bool = True
 
     max_boot_time: int = 60
     idle_timeout: int = 3600
+
     health_check: HealthCheckConfig = HealthCheckConfig()
 
+    # Container configuration
     ports: List[int] = field(default_factory=list)
-    volumes: Dict[str, str] = field(default_factory=dict)
+    mounts: List[MountConfig] = field(default_factory=list)
     environment: Dict[str, str] = field(default_factory=dict)
     cpuset_cpus: Optional[str] = None
 
@@ -91,7 +109,7 @@ class ServiceStatus(Enum):
 
 @dataclass
 class Service:
-    config: ContainerConfig
+    config: ServiceConfig
     name: str
     container_name: str
     container_id: str = ""
@@ -102,8 +120,7 @@ class Service:
 
     ram: int = 0
     vram: int = 0
-
-    # TODO: Peak is a weak metric, use moving average as well, use a class for this
+    boot_time: float = 0
     peak_vram: int = 0
     peak_ram: int = 0
     peak_boot_time: float = 0
@@ -125,11 +142,20 @@ class Service:
     def shutdown_cost(self) -> float:
         """Returns the cost shut down this container."""
         return (
-            self.peak_boot_time
-            / (self.vram + self.ram * 0.25)
+            max(1.0, self.boot_time)
+            / (self.vram + self.ram * 0.25 + 10**8)
             * max(0.0, 1.0 - self.idle_time / self.config.idle_timeout) ** 2
             * (10 if self.connections > 0 else 1)
+            * (1 if self.config.use_gpu else 0.5)
         )
+
+    @property
+    def reserved_ram(self) -> int:
+        return max(self.ram, convert_to_int(self.config.max_ram or 0))
+
+    @property
+    def reserved_vram(self) -> int:
+        return max(self.vram, convert_to_int(self.config.max_vram or 0))
 
 
 @cache
@@ -211,8 +237,45 @@ class ServiceManager:
         :param name: The container to start.
         """
         service = self.services[name]
+
+        # Container is already booting, await state change
+        if service.status == ServiceStatus.STARTING:
+            t = time.time()
+            while (
+                service.status == ServiceStatus.STARTING
+                and time.time() - t < service.config.max_boot_time
+            ):
+                time.sleep(0.1)
+            return
+
+        # Container is stopping, wait for it to stop, then restart
+        if service.status == ServiceStatus.STOPPING:
+            self.logger.warning("A stopping service was accessed!", name)
+            while service.status == ServiceStatus.STOPPING:
+                time.sleep(0.1)
+
+        # Container is already running
+        if service.status == ServiceStatus.RUNNING:
+            return
+
+        # Unexpected state
         if service.status != ServiceStatus.STOPPED:
-            return  # TODO: Not safe
+            self.logger.warning(
+                "Unexpected service state %s, should be stopped", service.status
+            )
+            return
+
+        # Look for a free device
+        service.device = self.allocate(
+            use_cpu=service.config.use_cpu,
+            use_gpu=service.config.use_gpu,
+            required_ram=convert_to_int(service.config.max_ram or service.peak_ram),
+            required_vram=convert_to_int(service.config.max_vram or service.peak_vram),
+        )
+
+        self.logger.info("Starting container %s on device %s", name, service.device)
+        service.status = ServiceStatus.STARTING
+
         with self.lock:
             try:
                 container = self.docker_client.containers.get(service.container_name)
@@ -221,6 +284,7 @@ class ServiceManager:
             except docker.errors.NotFound:
                 pass
 
+            # Find free ports
             service.ports = {port: find_unused_port() for port in service.config.ports}
 
             container = self.docker_client.containers.run(
@@ -234,32 +298,60 @@ class ServiceManager:
                     for docker_port, host_port in service.ports.items()
                 },
                 device_requests=[
-                    DeviceRequest(device_ids=["0"], capabilities=[["gpu"]])
+                    DeviceRequest(
+                        device_ids=[str(service.device)], capabilities=[["gpu"]]
+                    )
+                ]
+                if service.device >= 0
+                else [],
+                mounts=[
+                    Mount(
+                        target=m.target,
+                        source=m.source,
+                        type=m.type,
+                        read_only=m.read_only,
+                        consistency=m.consistency,
+                        propagation=m.propagation,
+                        no_copy=m.no_copy,
+                        labels=m.labels,
+                        driver_config=m.driver_config,
+                        tmpfs_size=m.tmpfs_size,
+                        tmpfs_mode=m.tmpfs_mode,
+                    )
+                    for m in service.config.mounts
                 ],
-            )  # TODO: Port can be none, use it
+                environment=service.config.environment,
+            )
 
+        # Sanity check and retrieve container ID
         self.refresh_containers()
-        self.logger.info("Starting container %s", name)
 
         # Wait for the container to boot
         t = time.time()
         while time.time() - t < service.config.max_boot_time:
             if check_container_health(container, service):
-                boot_time = time.time() - t
+                service.boot_time = time.time() - t
+                if service.boot_time > service.peak_boot_time:
+                    service.peak_boot_time = service.boot_time
+                    if service.boot_time > service.config.max_boot_time:
+                        self.logger.warning(
+                            "Container '%s' took %.1f seconds instead of estimated %d to boot.",
+                            name,
+                            service.boot_time,
+                            service.config.max_boot_time,
+                        )
+                service.status = ServiceStatus.RUNNING
                 self.logger.info(
-                    "Container '%s' ready after %.1f seconds.", name, boot_time
+                    "Container '%s' ready after %.1f seconds.", name, service.boot_time
                 )
-                service.peak_boot_time = max(service.peak_boot_time, boot_time)
                 return
 
-            time.sleep(max(0.1, min(1.0, service.config.max_boot_time / 10)))
+            time.sleep(0.1)
 
         self.logger.warning("Container '%s' seems to be stuck.", name)
 
     def stop_services(self, services: list[Service]) -> None:
         """Stops a list of containers."""
-        for service in services:
-            service.status = ServiceStatus.STOPPING
         for service in services:
             self.stop_service(service.name)
 
@@ -268,18 +360,37 @@ class ServiceManager:
         Shuts down a container, waiting for all connections to close.
         :param name: The container to stop.
         """
+        service = self.services[name]
+
+        if service.status == ServiceStatus.STOPPING:
+            self.logger.info("Service %s is already stopping.", name)
+            while service.status == ServiceStatus.STOPPING:
+                time.sleep(0.1)
+
+        if service.status == ServiceStatus.STARTING:
+            self.logger.warning("Attempting to stop service %s while starting.", name)
+            while service.status == ServiceStatus.STARTING:
+                time.sleep(0.1)
+
+        if service.status == ServiceStatus.STOPPED:
+            return
+
         self.logger.info("Stopping container %s", name)
 
-        while self.services[name].connections > 0:
+        # Mark as stopping to prevent new connections
+        service.status = ServiceStatus.STOPPING
+
+        # Wait for all connections to close
+        while service.connections > 0:
             self.logger.info(
                 "Waiting for %s connections on %s to close.",
-                self.services[name].connections,
+                service.connections,
                 name,
             )
             time.sleep(1)
 
         with self.lock:
-            service = self.services[name]
+            service = service
             # noinspection PyBroadException
             try:
                 self.docker_client.containers.get(service.container_id).stop()
@@ -307,35 +418,39 @@ class ServiceManager:
         """
         Refreshes the state of all containers.
         """
-        with self.lock:
-            name_to_service = {
-                service.container_name: service for service in self.services.values()
-            }
-            for container in self.docker_client.containers.list():
-                if container.name in name_to_service:
-                    service = name_to_service[container.name]
-                    service.container_id = str(container.id)
-                    service.pid = container.attrs["State"]["Pid"]
+        name_to_service = {
+            service.container_name: service for service in self.services.values()
+        }
+        for container in self.docker_client.containers.list():
+            if container.name in name_to_service:
+                service = name_to_service[container.name]
+                service.container_id = str(container.id)
+                service.pid = container.attrs["State"]["Pid"]
 
-                    if (
-                        service.status == ServiceStatus.STARTING
-                        and container.status
-                        not in (
-                            "running",
-                            "restarting",
-                            "created",
-                        )
-                    ):
-                        # The container does not seem to be restarting
-                        self.stop_service(service.name)
-                    elif (
-                        service.status == ServiceStatus.RUNNING
-                        and container.status != "running"
-                    ):
-                        # It seems the container is no longer running
-                        self.stop_service(service.name)
-                elif container.name.startswith("ca_"):
-                    container.remove(force=True)
+                if (
+                    service.status == ServiceStatus.STARTING
+                    and container.status
+                    not in (
+                        "running",
+                        "restarting",
+                        "created",
+                    )
+                ):
+                    # The container does not seem to be restarting
+                    self.stop_service(service.name)
+                elif (
+                    service.status == ServiceStatus.RUNNING
+                    and container.status != "running"
+                ):
+                    # It seems the container is no longer running
+                    self.stop_service(service.name)
+                elif service.status == ServiceStatus.STOPPED:
+                    # Container should not be running
+                    service.status = ServiceStatus.RUNNING
+                    self.stop_service(service.name)
+
+            elif container.name.startswith("ca_"):
+                container.remove(force=True)
 
     def refresh_container_memory(self) -> None:
         """
@@ -349,8 +464,26 @@ class ServiceManager:
                     all_pids = [service.pid] + get_child_processes(service.pid)
                     service.ram = max(ram.get(pid, 0) for pid in all_pids)
                     service.vram = sum(vram.get(pid, 0) for pid in all_pids)
-                    service.peak_ram = max(service.peak_ram, service.ram)
-                    service.peak_vram = max(service.peak_vram, service.vram)
+
+                    if service.ram > service.peak_ram:
+                        service.peak_ram = service.ram
+                        if service.ram > convert_to_int(service.config.max_ram or 0):
+                            self.logger.warning(
+                                "Container '%s' exceeded estimated RAM usage: %s > %s",
+                                service.name,
+                                humanize.naturalsize(service.ram),
+                                humanize.naturalsize(service.peak_ram),
+                            )
+
+                    if service.vram > service.peak_vram:
+                        service.peak_vram = service.vram
+                        if service.vram > convert_to_int(service.config.max_vram or 0):
+                            self.logger.warning(
+                                "Container '%s' exceeded estimated VRAM usage: %s > %s",
+                                service.name,
+                                humanize.naturalsize(service.vram),
+                                humanize.naturalsize(service.peak_vram),
+                            )
                 else:
                     service.ram = 0
                     service.vram = 0
@@ -369,15 +502,15 @@ class ServiceManager:
 
     def allocate(
         self,
-        uses_cpu: bool = True,
-        uses_gpu: bool = True,
+        use_cpu: bool = True,
+        use_gpu: bool = True,
         required_ram: int = 0,
         required_vram: int = 0,
     ) -> int:
         """
         Searches for a free device, shutting down containers if necessary.
-        :param uses_cpu: Can run on CPU.
-        :param uses_gpu: Can run on GPU.
+        :param use_cpu: Can run on CPU.
+        :param use_gpu: Can run on GPU.
         :param required_ram: Required RAM.
         :param required_vram: Required VRAM.
         :return: The device ID, or -1 for CPU.
@@ -387,59 +520,60 @@ class ServiceManager:
         system_ram = get_system_ram()
         system_vram = get_system_vram()
 
-        if uses_gpu:
-            # First, check if a GPU is free as it is
+        # Usage not caused by services
+        system_usage = {-1: max(0, system_ram.used - self.used_memory(-1))}
+        for gpu, memory_info in system_vram.items():
+            system_usage[gpu] = max(0, memory_info.used - self.used_memory(gpu))
+
+        # List all valid devices
+        valid_devices = []
+        if use_gpu:
             for gpu, memory_info in system_vram.items():
-                if memory_info.free > required_vram:
-                    return gpu
+                if memory_info.total - system_usage[gpu] >= required_vram:
+                    valid_devices.append(gpu)
+        if use_cpu:
+            if system_ram.total - system_usage[-1] >= required_ram:
+                valid_devices.append(-1)
 
-            # If not, for each device, check the average age of container to be closed
-            costs = {gpu: 0.0 for gpu in system_vram}
-            services_to_be_killed = {gpu: [] for gpu in system_vram}
-            for gpu, memory_info in system_vram.items():
-                if memory_info.total >= required_vram:
-                    services = self.list_services(gpu)
+        # Free memory for each device, considering reserved memory
+        free_memory = {
+            device: (system_ram.total if device < 0 else system_vram[device].total)
+            - system_usage[device]
+            - self.allocated_memory(device)
+            for device in (valid_devices + [-1])
+        }
 
-                    acc_ram = 0
-                    acc_vram = 0
-                    for service in services:
-                        costs[gpu] += service.shutdown_cost
-                        acc_ram += service.ram
-                        acc_vram += service.vram
-                        services_to_be_killed[gpu].append(service)
+        # Choose the device with the least cost to shut down
+        costs = {device: 0.0 for device in valid_devices}
+        services_to_be_killed = {device: [] for device in valid_devices}
+        for device in valid_devices:
+            services = self.list_services(device)
 
-                        # Stop when enough services are found
-                        if (
-                            memory_info.free + acc_vram >= required_vram
-                            and system_ram.free + acc_ram
-                        ):
-                            break
-
-            smallest_cost = min(list(costs.values()))
-            for gpu, memory_info in system_vram.items():
-                if costs[gpu] == smallest_cost:
-                    self.stop_services(services_to_be_killed[gpu])
-                    return gpu
-
-        if uses_cpu:
-            # First check if CPU fits as it is
-            if system_ram.free > required_ram:
-                raise ResourceExhaustedError()
-
-            # Otherwise shut down services
-            services = self.list_services(-1)
-
-            services_to_be_killed = []
             acc_ram = 0
+            acc_vram = 0
             for service in services:
-                acc_ram += service.ram
-                services_to_be_killed.append(service)
-
                 # Stop when enough services are found
-                if system_ram.free + acc_ram:
+                if (
+                    free_memory[-1] + acc_ram >= required_ram
+                    and free_memory[device] + acc_vram >= required_vram
+                ):
                     break
 
-            self.stop_services(services_to_be_killed)
+                acc_ram += service.reserved_ram
+                acc_vram += service.reserved_vram
+                costs[device] += service.shutdown_cost
+                services_to_be_killed[device].append(service)
+
+        # Avoid CPU when possible
+        if -1 in costs:
+            costs[-1] += 1_000_000
+
+        # Stop the services
+        smallest_cost = min(list(costs.values()))
+        for device in valid_devices:
+            if costs[device] == smallest_cost:
+                self.stop_services(services_to_be_killed[device])
+                return device
 
         raise ResourceExhaustedError()
 
@@ -448,9 +582,21 @@ class ServiceManager:
             [
                 service
                 for service in self.services.values()
-                if service.status == ServiceStatus.RUNNING and service.device == device
+                if service.status != ServiceStatus.STOPPED
+                and (service.device == device or device < 0)
             ],
             key=lambda service: service.shutdown_cost,
+        )
+
+    def used_memory(self, device: int) -> int:
+        """Returns the total allocated bytes for a device."""
+        return sum(s.vram for s in self.list_services(device))
+
+    def allocated_memory(self, device: int) -> int:
+        """Returns the total allocated bytes for a device."""
+        return sum(
+            (s.reserved_ram if device < 0 else s.reserved_vram)
+            for s in self.list_services(device)
         )
 
     def reload_settings_config(self) -> None:
@@ -481,13 +627,13 @@ class ServiceManager:
                 with self.config_path.open("r") as file:
                     configs = {
                         name: from_dict(
-                            ContainerConfig, config, config=Config(cast=[Enum])
+                            ServiceConfig, config, config=Config(cast=[Enum])
                         )
                         for name, config in yaml.safe_load(file).items()
                     }
 
                 # Shutdown all containers and mark for full re-initialization
-                for name in self.services.keys():
+                for name in list(self.services.keys()):
                     if (
                         name not in configs
                         or name in self.services
@@ -498,12 +644,13 @@ class ServiceManager:
 
                 # Init new or changed services
                 for name, config in configs.items():
-                    self.services[name] = Service(
-                        config=config,
-                        name=name,
-                        container_name=to_container_name(name),
-                        ports={p: -1 for p in config.ports},
-                    )
+                    if name not in self.services:
+                        self.services[name] = Service(
+                            config=config,
+                            name=name,
+                            container_name=to_container_name(name),
+                            ports={p: -1 for p in config.ports},
+                        )
 
                 self.logger.info("Services config reloaded.")
             except Exception:
