@@ -1,4 +1,5 @@
 import socket
+from dataclasses import dataclass
 
 import psutil
 import pynvml
@@ -7,8 +8,15 @@ from cachetools import cached, TTLCache
 MIN_POLL_INTERVAL = 1
 
 
+@dataclass
+class MemoryInfo:
+    free: int
+    used: int
+    total: int
+
+
 @cached(TTLCache(maxsize=1, ttl=MIN_POLL_INTERVAL))
-def get_system_vram() -> dict:
+def get_system_vram() -> dict[int, MemoryInfo]:
     """
     Get system VRAM for each GPU
     """
@@ -17,26 +25,26 @@ def get_system_vram() -> dict:
     for device_id in range(device_count):
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
         memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        devices[device_id] = {
-            "free": memory_info.free,
-            "used": memory_info.used,
-            "total": memory_info.total,
-        }
+        devices[device_id] = MemoryInfo(
+            free=int(memory_info.free),
+            used=int(memory_info.used),
+            total=int(memory_info.total),
+        )
 
     return devices
 
 
 @cached(TTLCache(maxsize=1, ttl=MIN_POLL_INTERVAL))
-def get_system_ram() -> dict:
+def get_system_ram() -> MemoryInfo:
     """
     Get system RAM usage and capacity
     """
     memory = psutil.virtual_memory()
-    return {
-        "free": memory.available,
-        "used": memory.used,
-        "total": memory.total,
-    }
+    return MemoryInfo(
+        free=memory.available,
+        used=memory.used,
+        total=memory.total,
+    )
 
 
 @cached(TTLCache(maxsize=1, ttl=MIN_POLL_INTERVAL))
@@ -51,7 +59,6 @@ def get_process_vram() -> dict[int, int]:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
         for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
             processes[process.pid] = process.usedGpuMemory
-            # todo and all its children (or other way around, follow up until a docker is found)
     return processes
 
 
