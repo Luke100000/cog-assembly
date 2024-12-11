@@ -5,14 +5,15 @@ from typing import Dict
 
 import docker
 import docker.errors
-import humanize
 import pynvml
 import requests
 from fastapi import FastAPI
 from fastapi import HTTPException, Request, Depends
+from humanize import naturalsize
 from prometheus_client import make_asgi_app
 from pydantic import BaseModel
-from starlette.responses import PlainTextResponse
+from starlette.background import BackgroundTask
+from starlette.responses import PlainTextResponse, StreamingResponse
 
 from cog_asembly.manager import ServiceManager, ServiceStatus
 from cog_asembly.metrics import start_metrics
@@ -76,9 +77,15 @@ def proxy_request(
             params=request.query_params,
             # auth=request.auth,
             cookies=request.cookies,
+            stream=True,
         )
 
-        return PlainTextResponse(response.content, status_code=response.status_code)
+        return StreamingResponse(
+            response.iter_content(chunk_size=1),
+            status_code=response.status_code,
+            headers=response.headers,
+            background=BackgroundTask(response.close),
+        )
 
     except Exception:
         logging.exception("Proxy request for %s failed", name)
@@ -113,15 +120,15 @@ def stats():
     return PlainTextResponse(
         "\n".join(
             [
-                f"System RAM: {humanize.naturalsize(ram.used)} of {humanize.naturalsize(ram.total)} used ({ram.used / ram.total:.1%}), {manager.allocated_memory(-1) / ram.total:.1%} allocated to services.",
+                f"System RAM: {naturalsize(ram.used)} of {naturalsize(ram.total)} used ({ram.used / ram.total:.1%}), {manager.allocated_memory(-1) / ram.total:.1%} allocated to services.",
                 *[
-                    f"GPU {gpu}: {humanize.naturalsize(vram.used)} of {humanize.naturalsize(vram.total)} used ({vram.used / vram.total:.1%}), {manager.allocated_memory(gpu) / vram.total:.1%} allocated to services."
+                    f"GPU {gpu}: {naturalsize(vram.used)} of {naturalsize(vram.total)} used ({vram.used / vram.total:.1%}), {manager.allocated_memory(gpu) / vram.total:.1%} allocated to services."
                     for gpu, vram in get_system_vram().items()
                 ],
                 "",
                 f"{sum([1 for service in manager.services.values() if service.status == ServiceStatus.RUNNING])} of {len(manager.services)} services running:",
                 *[
-                    f"- {service.name}: {service.status.value}, {humanize.naturalsize(service.ram)} RAM, {humanize.naturalsize(service.vram)} VRAM, {service.connections} connections"
+                    f"- {service.name}: {service.status.value}, {naturalsize(service.ram)} RAM, {naturalsize(service.vram)} VRAM, {service.connections} connections"
                     if service.status != ServiceStatus.STOPPED
                     else f"- {service.name}: {service.status.value}"
                     for service in manager.services.values()

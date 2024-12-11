@@ -1,4 +1,5 @@
 import threading
+import time
 
 from prometheus_client import Gauge
 
@@ -46,32 +47,39 @@ service_running = Gauge(
 
 
 def update_metrics(manager: ServiceManager):
-    # Update system RAM metrics
-    ram = get_system_ram()
-    ram_total.set(ram.total)
-    ram_used.set(ram.used)
-    ram_free.set(ram.free)
+    while True:
+        # Update system RAM metrics
+        ram = get_system_ram()
+        ram_total.set(ram.total)
+        ram_used.set(ram.used)
+        ram_free.set(ram.free)
 
-    # Update system VRAM metrics
-    vram = get_system_vram()
-    for gpu, data in vram.items():
-        vram_total.labels(gpu=gpu).set(data.total)
-        vram_used.labels(gpu=gpu).set(data.used)
-        vram_free.labels(gpu=gpu).set(data.free)
+        # Update system VRAM metrics
+        vram = get_system_vram()
+        for gpu, data in vram.items():
+            vram_total.labels(gpu=gpu).set(data.total)
+            vram_used.labels(gpu=gpu).set(data.used)
+            vram_free.labels(gpu=gpu).set(data.free)
 
-    # Update service metrics
-    for service in manager.services.values():
-        service_peak_ram.labels(service_name=service.name).set(service.peak_ram)
-        service_peak_vram.labels(service_name=service.name).set(service.peak_vram)
-        service_boot_time.labels(service_name=service.name).set(service.peak_boot_time)
-        service_current_ram.labels(service_name=service.name).set(service.ram)
-        service_current_vram.labels(service_name=service.name).set(service.vram)
-        service_connections.labels(service_name=service.name).set(service.connections)
-
-        for status in ServiceStatus:
-            service_running.labels(service_name=service.name, status=status.value).set(
-                1 if service.status == status else 0
+        # Update service metrics
+        for service in manager.services.values():
+            service_peak_ram.labels(service_name=service.name).set(service.peak_ram)
+            service_peak_vram.labels(service_name=service.name).set(service.peak_vram)
+            service_boot_time.labels(service_name=service.name).set(
+                service.peak_boot_time
             )
+            service_current_ram.labels(service_name=service.name).set(service.ram)
+            service_current_vram.labels(service_name=service.name).set(service.vram)
+            service_connections.labels(service_name=service.name).set(
+                service.connections
+            )
+
+            for status in ServiceStatus:
+                service_running.labels(
+                    service_name=service.name, status=status.value
+                ).set(1 if service.status == status else 0)
+
+        time.sleep(5)
 
 
 def start_metrics(manager: ServiceManager):
