@@ -33,21 +33,6 @@ class ResourceExhaustedError(Exception):
     pass
 
 
-@dataclass
-class User:
-    name: str = "Unnamed"
-    token: str = uuid.uuid4().hex
-    can_cold_start: bool = True
-    can_access_logs: bool = False
-    whitelist: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ManagerSettings:
-    update_interval: float = 5.0
-    users: List[User] = field(default_factory=list)
-
-
 class HealthCheckMode(Enum):
     HTTP = "http"
     LOG = "log"
@@ -98,6 +83,21 @@ class ServiceConfig:
     mounts: List[MountConfig] = field(default_factory=list)
     environment: Dict[str, str] = field(default_factory=dict)
     cpuset_cpus: Optional[str] = None
+
+
+@dataclass
+class User:
+    token: str = uuid.uuid4().hex
+    can_access_logs: bool = False
+    can_access_stats: bool = False
+    whitelist: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ManagerSettings:
+    update_interval: float = 5.0
+    users: Dict[str, User] = field(default_factory=dict)
+    services: Dict[str, ServiceConfig] = field(default_factory=dict)
 
 
 class ServiceStatus(Enum):
@@ -203,27 +203,22 @@ def check_container_health(container: Container, service: Service) -> bool:
 
 
 class ServiceManager:
-    def __init__(
-        self,
-        settings_path: Path = Path("settings.yaml"),
-        config_path: Path = Path("services.yaml"),
-    ) -> None:
+    def __init__(self, config_path: Path = Path("config.yaml")) -> None:
         self.logger = logging.getLogger("ServiceManager")
 
         self.docker_client = docker.from_env()
 
         self.lock = threading.Lock()
 
-        self.settings: ManagerSettings = ManagerSettings()
+        self.config: ManagerSettings = ManagerSettings()
+        self.tokens: dict[str, str] = {}
         self.services: dict[str, Service] = {}
 
         # Define container configurations
         self.last_settings_reload = 0
         self.last_config_reload = 0
-        self.settings_path = settings_path
         self.config_path = config_path
-        self.reload_settings_config()
-        self.reload_services_config()
+        self.reload_config()
 
         # Register existing containers
         self.refresh_containers()
@@ -407,12 +402,11 @@ class ServiceManager:
             self.refresh_containers()
             self.refresh_container_memory()
 
-            self.reload_services_config()
-            self.reload_settings_config()
+            self.reload_config()
 
             self.cleanup_containers()
 
-            time.sleep(self.settings.update_interval)
+            time.sleep(self.config.update_interval)
 
     def refresh_containers(self) -> None:
         """
@@ -599,59 +593,46 @@ class ServiceManager:
             for s in self.list_services(device)
         )
 
-    def reload_settings_config(self) -> None:
-        modtime = self.settings_path.lstat().st_mtime
+    def reload_config(self) -> None:
+        modtime = self.config_path.lstat().st_mtime
         if modtime != self.last_settings_reload:
             self.last_settings_reload = modtime
 
             # noinspection PyBroadException
             try:
                 with self.config_path.open("r") as file:
-                    self.settings = from_dict(
+                    self.config = from_dict(
                         ManagerSettings,
                         yaml.safe_load(file),
                         config=Config(cast=[Enum]),
                     )
 
+                    self.tokens = {
+                        user.token: name for name, user in self.config.users.items()
+                    }
+                    if len(self.tokens) != len(self.config.users):
+                        self.logger.warning("Duplicate user tokens detected!")
+
+                    # Shutdown all containers and mark for full re-initialization
+                    for name in list(self.services.keys()):
+                        if (
+                            name not in self.config.services
+                            or name in self.services
+                            and self.services[name].config != self.config.services[name]
+                        ):
+                            self.stop_service(name)
+                            del self.services[name]
+
+                    # Init new or changed services
+                    for name, config in self.config.services.items():
+                        if name not in self.services:
+                            self.services[name] = Service(
+                                config=config,
+                                name=name,
+                                container_name=to_container_name(name),
+                                ports={p: -1 for p in config.ports},
+                            )
+
                 self.logger.info("Settings config reloaded.")
             except Exception:
                 self.logger.exception("Failed to reload settings file.")
-
-    def reload_services_config(self) -> None:
-        modtime = self.config_path.lstat().st_mtime
-        if modtime != self.last_config_reload:
-            self.last_config_reload = modtime
-
-            # noinspection PyBroadException
-            try:
-                with self.config_path.open("r") as file:
-                    configs = {
-                        name: from_dict(
-                            ServiceConfig, config, config=Config(cast=[Enum])
-                        )
-                        for name, config in yaml.safe_load(file).items()
-                    }
-
-                # Shutdown all containers and mark for full re-initialization
-                for name in list(self.services.keys()):
-                    if (
-                        name not in configs
-                        or name in self.services
-                        and self.services[name].config != configs[name]
-                    ):
-                        self.stop_service(name)
-                        del self.services[name]
-
-                # Init new or changed services
-                for name, config in configs.items():
-                    if name not in self.services:
-                        self.services[name] = Service(
-                            config=config,
-                            name=name,
-                            container_name=to_container_name(name),
-                            ports={p: -1 for p in config.ports},
-                        )
-
-                self.logger.info("Services config reloaded.")
-            except Exception:
-                self.logger.exception("Failed to reload config file.")

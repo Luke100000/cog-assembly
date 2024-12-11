@@ -1,5 +1,4 @@
 .idea
 .venv
 
-settings.yaml
-services.yaml
+config.yaml

@@ -15,18 +15,12 @@ uvicorn main:app
 
 ## Configuration
 
-`settings.yaml` contains the configuration for the manager.
-```yaml
-
-```
-
-`services.yaml` contains the configuration for the services.
-```yaml
-```
+[`config.yaml`](config_template.yaml) contains the configuration, the template contains an example and documentation.
 
 ## Usage
 
 The service is now exposed under `/c/<service>/<endpoint>`.
+
 ```bash
 curl -s -X POST \
   -H "Content-Type: application/json" \
@@ -37,3 +31,9 @@ curl -s -X POST \
   }' \
   http://localhost:8000/c/text-extract-ocr/predictions
 ```
+
+## Authentication
+
+The Bearer token is used to authenticate requests.
+Configure users in the config.
+If no token is provided, the `default` user is used.

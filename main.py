@@ -1,7 +1,7 @@
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, Optional
 
 import docker
 import docker.errors
@@ -9,13 +9,14 @@ import pynvml
 import requests
 from fastapi import FastAPI
 from fastapi import HTTPException, Request, Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from humanize import naturalsize
 from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from cog_asembly.manager import ServiceManager, ServiceStatus
+from cog_asembly.manager import ServiceManager, ServiceStatus, User
 from cog_asembly.metrics import start_metrics
 from cog_asembly.utils import (
     get_system_ram,
@@ -51,12 +52,31 @@ async def get_body(request: Request):
     return await request.body()
 
 
+def get_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        HTTPBearer(auto_error=False)
+    ),
+):
+    if credentials is None:
+        return manager.config.users.get("default")
+    if credentials.scheme != "Bearer" or credentials.credentials not in manager.tokens:
+        raise HTTPException(401, "Invalid token")
+    return manager.tokens[credentials.credentials]
+
+
 @app.api_route("/c/{name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 def proxy_request(
-    name: str, path: str, request: Request, body: bytes = Depends(get_body)
+    name: str,
+    path: str,
+    request: Request,
+    body: bytes = Depends(get_body),
+    user: User = Depends(get_user),
 ):
     if name not in manager.services:
         raise HTTPException(404, "Container not found")
+
+    if user.whitelist and name not in user.whitelist:
+        raise HTTPException(403, "You do not have access to this service")
 
     service = manager.services[name]
 
@@ -98,9 +118,15 @@ def proxy_request(
 
 
 @app.get("/log/{path:path}")
-def get_log(path: str):
+def get_log(
+    path: str,
+    user: User = Depends(get_user),
+):
     if path not in manager.services:
         raise HTTPException(404, "Container not found")
+
+    if not user.can_access_logs:
+        raise HTTPException(403, "You do not have access to logs")
 
     service = manager.services[path]
 
@@ -115,7 +141,10 @@ def get_log(path: str):
 
 
 @app.get("/health", description="Get the overall health status of the service manager")
-def stats():
+def stats(user: User = Depends(get_user)):
+    if not user.can_access_stats:
+        raise HTTPException(403, "You do not have access to stats")
+
     ram = get_system_ram()
     return PlainTextResponse(
         "\n".join(
