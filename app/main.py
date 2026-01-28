@@ -7,6 +7,7 @@ import docker
 import docker.errors
 import pynvml
 import requests
+import uvicorn
 from fastapi import FastAPI
 from fastapi import HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,12 +17,9 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.responses import PlainTextResponse, StreamingResponse
 
-from cog_asembly.manager import ServiceManager, ServiceStatus, User
-from cog_asembly.metrics import start_metrics
-from cog_asembly.utils import (
-    get_system_ram,
-    get_system_vram,
-)
+from app.manager import ServiceManager, ServiceStatus, User
+from app.metrics import start_metrics
+from app.utils import get_system_ram, get_system_vram
 
 logging.basicConfig(level=logging.INFO)
 
@@ -165,3 +163,7 @@ def stats(user: User = Depends(get_user)):
             ],
         )
     )
+
+
+if __name__ == "__main__":
+    uvicorn.run(app)

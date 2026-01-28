@@ -3,11 +3,8 @@ import time
 
 from prometheus_client import Gauge
 
-from cog_asembly.manager import ServiceManager, ServiceStatus
-from cog_asembly.utils import (
-    get_system_ram,
-    get_system_vram,
-)
+from app.manager import ServiceManager, ServiceStatus
+from app.utils import get_system_ram, get_system_vram
 
 # Prometheus Gauges for system metrics
 ram_total = Gauge("ram_total_bytes", "Total system RAM")

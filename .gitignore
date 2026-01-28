@@ -1,4 +1,7 @@
 .idea
 .venv
 
+data
+data_docker
+
 config.yaml

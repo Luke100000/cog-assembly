@@ -1,25 +1,23 @@
-[tool.poetry]
+[project]
 name = "cog-assembly"
 version = "0.1.0"
-description = ""
-authors = ["Luke100000 <jonas.peche@aon.at>"]
+description = "Add your description here"
 readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cachetools>=6.2.6",
+    "dacite>=1.9.2",
+    "docker>=7.1.0",
+    "fastapi>=0.128.0",
+    "humanize>=4.15.0",
+    "nvidia-ml-py>=13.590.48",
+    "prometheus-client>=0.24.1",
+    "psutil>=7.2.1",
+    "pydantic>=2.12.5",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.40.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-docker = "^7.1.0"
-fastapi = "^0.115.2"
-pydantic = "^2.9.2"
-uvicorn = "^0.32.0"
-nvidia-ml-py = "^12.560.30"
-psutil = "^6.1.0"
-dacite = "^1.8.1"
-pyyaml = "^6.0.2"
-prometheus-client = "^0.21.0"
-humanize = "^4.11.0"
-cachetools = "^5.5.0"
 
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[project.scripts]
+run = "uvicorn app.main:app"

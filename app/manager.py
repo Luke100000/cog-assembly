@@ -18,7 +18,7 @@ from dacite import from_dict, Config
 from docker.models.containers import Container
 from docker.types import DeviceRequest, Mount
 
-from cog_asembly.utils import (
+from app.utils import (
     get_process_ram,
     get_process_vram,
     get_child_processes,

@@ -1,16 +1,26 @@
 # Cog-Assembly
 
-Simple, single system docker manager for http services with focus on VRAM scheduling.
+Simple, single system docker manager for http services with focus on RAM and VRAM scheduling.
 Connecting to a cold container boots up the container transparently and forwards the request to it.
 Recommended for [Cog inference](https://github.com/replicate/cog) but generally every http service can be managed.
+Comes with an admin panel, dashboard, metrics, and OpenAPI compatible UI.
 
 ## Installation
+
+Either use Docker:
+
+```bash
+docker run -p 8000:8000 -v ./data:/data luke100000/cog-assembly
+```
+
+Or install from source:
 
 ```bash
 git clone https://github.com/Luke100000/cog-assembly.git
 cd cog-assembly
-poetry install
-uvicorn main:app
+
+uv sync
+uv run uvicorn app.main:app
 ```
 
 ## Configuration
