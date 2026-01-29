@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 import threading
@@ -7,17 +8,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Dict, Optional, List, Any, Union
+from typing import Optional, List
 
 import docker
 import docker.errors
 import humanize
 import requests
-import yaml
-from dacite import from_dict, Config
 from docker.models.containers import Container
 from docker.types import DeviceRequest, Mount
 
+from app.database import SessionLocal
+from app.models import ServiceModel
 from app.utils import (
     get_process_ram,
     get_process_vram,
@@ -40,32 +41,8 @@ class HealthCheckMode(Enum):
 
 
 @dataclass
-class HealthCheckConfig:
-    timeout: int = 5
-    mode: HealthCheckMode = HealthCheckMode.HTTP
-    url: str = ""
-    regex: str = ""
-
-
-@dataclass
-class MountConfig:
-    target: str
-    source: str
-    type: str = "volume"
-    read_only: bool = False
-    consistency: Optional[str] = None
-    propagation: Optional[str] = None
-    no_copy: bool = False
-    labels: Optional[Dict[str, Any]] = None
-    driver_config: Optional[Any] = None
-    tmpfs_size: Optional[Union[int, str]] = None
-    tmpfs_mode: Optional[int] = None
-
-
-@dataclass
 class ServiceConfig:
     image: str
-    public: bool = True
 
     max_vram: Optional[str] = None
     max_ram: Optional[str] = None
@@ -76,16 +53,19 @@ class ServiceConfig:
     max_boot_time: int = 60
     idle_timeout: int = 3600
 
-    health_check: HealthCheckConfig = HealthCheckConfig()
+    # Health check fields
+    health_check_type: str = "none"  # none, http, log
+    health_check_url: str = ""
+    health_check_regex: str = ""
 
     # Container configuration
-    ports: List[int] = field(default_factory=list)
-    mounts: List[MountConfig] = field(default_factory=list)
-    environment: Dict[str, str] = field(default_factory=dict)
+    port: int = 6000
+    mounts: str = ""  # multi-line string
+    environment: str = ""  # multi-line string
     cpuset_cpus: Optional[str] = None
 
     # Permission group required to access this service (empty = public)
-    required_group: str = ""
+    permission_group: str = ""
 
 
 @dataclass
@@ -96,12 +76,6 @@ class User:
     def has_group(self, group: str) -> bool:
         """Check if user has a specific permission group. Admin has access to everything."""
         return "admin" in self.groups or group in self.groups
-
-
-@dataclass
-class ManagerSettings:
-    update_interval: float = 5.0
-    services: Dict[str, ServiceConfig] = field(default_factory=dict)
 
 
 class ServiceStatus(Enum):
@@ -132,11 +106,7 @@ class Service:
     connections: int = 0  # TODO: Thread safe
     last_activity: float = 0
 
-    ports: Dict[int, int] = field(default_factory=dict)
-
-    @property
-    def primary_port(self) -> int:
-        return self.ports[self.config.ports[0]]
+    host_port: int = -1
 
     @property
     def idle_time(self) -> float:
@@ -177,30 +147,30 @@ def check_container_health(container: Container, service: Service) -> bool:
     :param service: The service to check.
     :return: True if the container is healthy.
     """
-    health_check = service.config.health_check
-
-    if health_check.mode == HealthCheckMode.NONE:
+    if service.config.health_check_type == HealthCheckMode.NONE.value:
         return True
-    elif health_check.mode == HealthCheckMode.HTTP:
+    elif service.config.health_check_type == HealthCheckMode.HTTP.value:
         try:
-            # noinspection HttpUrlsUsage
             response = requests.get(
-                f"http://127.0.0.1:{service.primary_port}/{health_check.url}",
-                timeout=health_check.timeout,
+                f"http://127.0.0.1:{service.host_port}/{service.config.health_check_url}",
+                timeout=30,
             )
-            if health_check.regex == "":
+            if not service.config.health_check_regex:
                 return True
-            return re.search(health_check.regex, response.text) is not None
+
+            return (
+                re.search(service.config.health_check_regex, response.text) is not None
+            )
         except requests.ConnectionError:
             return False
         except requests.Timeout:
             return False
-    elif health_check.mode == HealthCheckMode.LOG:
+    elif service.config.health_check_type == HealthCheckMode.LOG.value:
         try:
             logs = container.logs().decode("utf-8")
-            if health_check.regex == "":
+            if not service.config.health_check_regex:
                 return len(logs) > 0
-            return re.search(health_check.regex, logs) is not None
+            return re.search(service.config.health_check_regex, logs) is not None
         except docker.errors.NotFound or docker.errors.NullResource:
             return False
     return False
@@ -214,16 +184,15 @@ class ServiceManager:
 
         self.lock = threading.Lock()
 
-        self.config: ManagerSettings = ManagerSettings()
         self.services: dict[str, Service] = {}
 
         # Define container configurations
         self.last_settings_reload = 0
         self.last_config_reload = 0
         self.config_path = config_path
-        self.reload_config()
 
         # Register existing containers
+        self.refresh_services()
         self.refresh_containers()
 
         self.updater = threading.Thread(target=self.update_loop, daemon=True)
@@ -248,7 +217,7 @@ class ServiceManager:
 
         # Container is stopping, wait for it to stop, then restart
         if service.status == ServiceStatus.STOPPING:
-            self.logger.warning("A stopping service was accessed!", name)
+            self.logger.warning("A stopping service was accessed! %s", name)
             while service.status == ServiceStatus.STOPPING:
                 time.sleep(0.1)
 
@@ -259,7 +228,9 @@ class ServiceManager:
         # Unexpected state
         if service.status != ServiceStatus.STOPPED:
             self.logger.warning(
-                "Unexpected service state %s, should be stopped", service.status
+                "Unexpected service state %s for %s, should be stopped",
+                service.status,
+                name,
             )
             return
 
@@ -282,19 +253,30 @@ class ServiceManager:
             except docker.errors.NotFound:
                 pass
 
-            # Find free ports
-            service.ports = {port: find_unused_port() for port in service.config.ports}
+            # Find free port
+            service.host_port = find_unused_port()
+
+            # Parse environment and mounts
+            docker_mounts = []
+            for m in parse_mounts_multiline(service.config.mounts):
+                if ":" in m:
+                    docker_mounts.append(Mount.parse_mount_string(m))
+                else:
+                    docker_mounts.append(
+                        Mount(
+                            target=m,
+                            source=f"ca_{service.container_name}_{hashlib.md5(m.encode()).hexdigest()}",
+                            type="volume",
+                        )
+                    )
 
             container = self.docker_client.containers.run(
                 image=service.config.image,
                 name=service.container_name,
                 detach=True,
                 mem_limit=service.config.max_ram,
-                cpuset_cpus=service.config.cpuset_cpus,  # TODO: Verify hyper-threading
-                ports={
-                    f"{docker_port}/tcp": host_port
-                    for docker_port, host_port in service.ports.items()
-                },
+                cpuset_cpus=service.config.cpuset_cpus,
+                ports={f"{service.config.port}/tcp": service.host_port},
                 device_requests=[
                     DeviceRequest(
                         device_ids=[str(service.device)], capabilities=[["gpu"]]
@@ -302,23 +284,8 @@ class ServiceManager:
                 ]
                 if service.device >= 0
                 else [],
-                mounts=[
-                    Mount(
-                        target=m.target,
-                        source=m.source,
-                        type=m.type,
-                        read_only=m.read_only,
-                        consistency=m.consistency,
-                        propagation=m.propagation,
-                        no_copy=m.no_copy,
-                        labels=m.labels,
-                        driver_config=m.driver_config,
-                        tmpfs_size=m.tmpfs_size,
-                        tmpfs_mode=m.tmpfs_mode,
-                    )
-                    for m in service.config.mounts
-                ],
-                environment=service.config.environment,
+                mounts=docker_mounts,
+                environment=parse_env_multiline(service.config.environment),
             )
 
         # Sanity check and retrieve container ID
@@ -347,11 +314,6 @@ class ServiceManager:
             time.sleep(0.1)
 
         self.logger.warning("Container '%s' seems to be stuck.", name)
-
-    def stop_services(self, services: list[Service]) -> None:
-        """Stops a list of containers."""
-        for service in services:
-            self.stop_service(service.name)
 
     def stop_service(self, name: str) -> None:
         """
@@ -402,14 +364,58 @@ class ServiceManager:
         The main update loop, refreshes the state of all containers and their memory usage.
         """
         while True:
+            self.refresh_services()
+
             self.refresh_containers()
             self.refresh_container_memory()
 
-            self.reload_config()
-
             self.cleanup_containers()
 
-            time.sleep(self.config.update_interval)
+            time.sleep(5)
+
+    def refresh_services(self) -> None:
+        session = SessionLocal()
+        try:
+            db_names = {name for (name,) in session.query(ServiceModel.name).all()}
+
+            # remove services no longer in database
+            for name in set(self.services) - db_names:
+                self.stop_service(name)
+                del self.services[name]
+
+            # add missing services
+            missing = db_names - set(self.services)
+            if not missing:
+                return
+
+            rows = (
+                session.query(ServiceModel).filter(ServiceModel.name.in_(missing)).all()
+            )
+
+            for db in rows:
+                self.services[db.name] = Service(
+                    name=db.name,
+                    container_name=to_container_name(db.name),
+                    config=ServiceConfig(
+                        image=db.image,
+                        max_vram=db.max_vram,
+                        max_ram=db.max_ram,
+                        use_gpu=db.use_gpu,
+                        use_cpu=db.use_cpu,
+                        max_boot_time=db.max_boot_time or 60,
+                        idle_timeout=db.idle_timeout or 3600,
+                        health_check_type=db.health_check_type or "none",
+                        health_check_url=db.health_check_url or "",
+                        health_check_regex=db.health_check_regex or "",
+                        port=db.port,
+                        mounts=db.mounts or "",
+                        environment=db.environment or "",
+                        cpuset_cpus=db.cpuset_cpus,
+                        permission_group=db.permission_group or "",
+                    ),
+                )
+        finally:
+            session.close()
 
     def refresh_containers(self) -> None:
         """
@@ -427,11 +433,11 @@ class ServiceManager:
                 if (
                     service.status == ServiceStatus.STARTING
                     and container.status
-                    not in (
+                    not in {
                         "running",
                         "restarting",
                         "created",
-                    )
+                    }
                 ):
                     # The container does not seem to be restarting
                     self.stop_service(service.name)
@@ -447,6 +453,7 @@ class ServiceManager:
                     self.stop_service(service.name)
 
             elif container.name.startswith("ca_"):
+                # Unknown container
                 container.remove(force=True)
 
     def refresh_container_memory(self) -> None:
@@ -569,12 +576,14 @@ class ServiceManager:
         smallest_cost = min(list(costs.values()))
         for device in valid_devices:
             if costs[device] == smallest_cost:
-                self.stop_services(services_to_be_killed[device])
+                for service in services_to_be_killed[device]:
+                    self.stop_service(service.name)
                 return device
 
         raise ResourceExhaustedError()
 
     def list_services(self, device: int) -> list[Service]:
+        """List services in memory."""
         return sorted(
             [
                 service
@@ -596,40 +605,20 @@ class ServiceManager:
             for s in self.list_services(device)
         )
 
-    def reload_config(self) -> None:
-        modtime = self.config_path.lstat().st_mtime
-        if modtime != self.last_settings_reload:
-            self.last_settings_reload = modtime
 
-            # noinspection PyBroadException
-            try:
-                with self.config_path.open("r") as file:
-                    self.config = from_dict(
-                        ManagerSettings,
-                        yaml.safe_load(file),
-                        config=Config(cast=[Enum]),
-                    )
+def parse_env_multiline(env_str: str) -> dict:
+    env = {}
+    for line in env_str.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip()
+    return env
 
-                    # Shutdown all containers and mark for full re-initialization
-                    for name in list(self.services.keys()):
-                        if (
-                            name not in self.config.services
-                            or name in self.services
-                            and self.services[name].config != self.config.services[name]
-                        ):
-                            self.stop_service(name)
-                            del self.services[name]
 
-                    # Init new or changed services
-                    for name, config in self.config.services.items():
-                        if name not in self.services:
-                            self.services[name] = Service(
-                                config=config,
-                                name=name,
-                                container_name=to_container_name(name),
-                                ports={p: -1 for p in config.ports},
-                            )
-
-                self.logger.info("Settings config reloaded.")
-            except Exception:
-                self.logger.exception("Failed to reload settings file.")
+def parse_mounts_multiline(mounts_str: str) -> list:
+    mounts = []
+    for line in mounts_str.splitlines():
+        line = line.strip()
+        if line:
+            mounts.append(line)
+    return mounts

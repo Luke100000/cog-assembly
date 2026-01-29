@@ -116,13 +116,14 @@ def proxy_request(
 
     service = manager.services[name]
 
-    # Check if service requires a specific group
-    if service.config.required_group:
-        if not user.has_group(service.config.required_group):
-            raise HTTPException(
-                403,
-                f"You do not have access to this service (requires group: {service.config.required_group})",
-            )
+    # Check permissions
+    if service.config.permission_group and not user.has_group(
+        service.config.permission_group
+    ):
+        raise HTTPException(
+            403,
+            f"You do not have access to this service (requires group: {service.config.permission_group})",
+        )
 
     service.connections += 1
     service.last_activity = time.time()
@@ -133,7 +134,7 @@ def proxy_request(
         # Forward the request
         response = requests.request(
             request.method,
-            url=f"http://127.0.0.1:{service.primary_port}/{path}",
+            url=f"http://127.0.0.1:{service.host_port}/{path}",
             headers=dict(request.headers),
             # files=request.files,  # TODO
             data=body,
@@ -153,9 +154,7 @@ def proxy_request(
 
     except Exception:
         logging.exception("Proxy request for %s failed", name)
-        raise HTTPException(
-            404, "Unknown error, are you sure this endpoint is correct?"
-        )
+        raise HTTPException(404, "Unknown error")
 
     finally:
         service.connections -= 1

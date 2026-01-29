@@ -3,9 +3,10 @@
 from sqladmin import Admin, ModelView
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
+from wtforms.widgets import TextArea
 
 from app.database import engine, SessionLocal
-from app.models import UserModel
+from app.models import UserModel, ServiceModel
 from app.password import verify_password
 
 
@@ -54,6 +55,65 @@ class UserAdmin(ModelView, model=UserModel):
             "description": "Unique token for API authentication",
         },
     }
+
+
+class ServiceAdmin(ModelView, model=ServiceModel):
+    """Admin view for Service management."""
+
+    column_list = [
+        ServiceModel.name,
+        ServiceModel.image,
+        ServiceModel.permission_group,
+    ]
+    column_searchable_list = [ServiceModel.name, ServiceModel.image]
+    column_sortable_list = [ServiceModel.name]
+    form_columns = [
+        ServiceModel.name,
+        ServiceModel.image,
+        ServiceModel.max_vram,
+        ServiceModel.max_ram,
+        ServiceModel.use_gpu,
+        ServiceModel.use_cpu,
+        ServiceModel.max_boot_time,
+        ServiceModel.idle_timeout,
+        ServiceModel.health_check_type,
+        ServiceModel.health_check_url,
+        ServiceModel.health_check_regex,
+        ServiceModel.port,
+        ServiceModel.mounts,
+        ServiceModel.environment,
+        ServiceModel.cpuset_cpus,
+        ServiceModel.permission_group,
+    ]
+    form_args = {
+        "environment": {
+            "label": "Environment Variables",
+            "description": "Enter one key=value pair per line.",
+            "render_kw": {"rows": 4, "style": "font-family:monospace;"},
+            "widget": TextArea(),
+        },
+        "mounts": {
+            "label": "Mounts",
+            "description": "Enter one mount descriptor per line.",
+            "render_kw": {"rows": 4, "style": "font-family:monospace;"},
+            "widget": TextArea(),
+        },
+        "health_check_type": {
+            "label": "Health Check Type",
+            "description": "none, http, or log",
+        },
+        "health_check_url": {
+            "label": "Health Check URL",
+            "description": "URL for HTTP health check (if type is http)",
+        },
+        "health_check_regex": {
+            "label": "Health Check Regex",
+            "description": "Regex for log or HTTP health check",
+        },
+    }
+    name = "Service"
+    name_plural = "Services"
+    icon = "fa-solid fa-server"
 
 
 class AdminAuthBackend(AuthenticationBackend):
@@ -112,4 +172,5 @@ def setup_admin(app, secret_key: str):
     authentication_backend = AdminAuthBackend(secret_key=secret_key)
     admin = Admin(app, engine, authentication_backend=authentication_backend)
     admin.add_view(UserAdmin)
+    admin.add_view(ServiceAdmin)
     return admin
