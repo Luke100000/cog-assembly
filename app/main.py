@@ -15,16 +15,34 @@ from humanize import naturalsize
 from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import PlainTextResponse, StreamingResponse
 
+from app.admin import setup_admin
+from app.database import init_db, SessionLocal, create_default_user_if_empty
+from app.models import UserModel
 from app.manager import ServiceManager, ServiceStatus, User
 from app.metrics import start_metrics
+from app.password import get_or_create_secret_key
 from app.utils import get_system_ram, get_system_vram
 
 logging.basicConfig(level=logging.INFO)
 
+init_db()
+create_default_user_if_empty()
+
 pynvml.nvmlInit()
+
 manager = ServiceManager()
+
+# Get or create secret key
+SECRET_KEY = get_or_create_secret_key()
+
+# Static public user for unauthenticated requests
+PUBLIC_USER = User(
+    token="public",
+    groups=[],
+)
 
 
 # noinspection PyUnusedLocal
@@ -36,6 +54,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Add session middleware for admin authentication
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+
+# Setup SQLAdmin
+setup_admin(app, SECRET_KEY)
 
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
@@ -54,12 +78,29 @@ def get_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(
         HTTPBearer(auto_error=False)
     ),
-):
+) -> User:
+    # No credentials = public user (no permissions)
     if credentials is None:
-        return manager.config.users.get("default")
-    if credentials.scheme != "Bearer" or credentials.credentials not in manager.tokens:
-        raise HTTPException(401, "Invalid token")
-    return manager.tokens[credentials.credentials]
+        return PUBLIC_USER
+
+    if credentials.scheme != "Bearer":
+        raise HTTPException(401, "Invalid authentication scheme")
+
+    # Query user by token
+    session = SessionLocal()
+    try:
+        db_user = (
+            session.query(UserModel).filter_by(token=credentials.credentials).first()
+        )
+        if not db_user:
+            raise HTTPException(401, "Invalid token")
+
+        return User(
+            token=db_user.token,
+            groups=db_user.get_groups_list(),
+        )
+    finally:
+        session.close()
 
 
 @app.api_route("/c/{name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -73,10 +114,15 @@ def proxy_request(
     if name not in manager.services:
         raise HTTPException(404, "Container not found")
 
-    if user.whitelist and name not in user.whitelist:
-        raise HTTPException(403, "You do not have access to this service")
-
     service = manager.services[name]
+
+    # Check if service requires a specific group
+    if service.config.required_group:
+        if not user.has_group(service.config.required_group):
+            raise HTTPException(
+                403,
+                f"You do not have access to this service (requires group: {service.config.required_group})",
+            )
 
     service.connections += 1
     service.last_activity = time.time()
@@ -123,8 +169,10 @@ def get_log(
     if path not in manager.services:
         raise HTTPException(404, "Container not found")
 
-    if not user.can_access_logs:
-        raise HTTPException(403, "You do not have access to logs")
+    if not user.has_group("admin"):
+        raise HTTPException(
+            403, "You do not have access to logs (requires admin group)"
+        )
 
     service = manager.services[path]
 
@@ -140,8 +188,10 @@ def get_log(
 
 @app.get("/health", description="Get the overall health status of the service manager")
 def stats(user: User = Depends(get_user)):
-    if not user.can_access_stats:
-        raise HTTPException(403, "You do not have access to stats")
+    if not user.has_group("stats"):
+        raise HTTPException(
+            403, "You do not have access to stats (requires stats or admin group)"
+        )
 
     ram = get_system_ram()
     return PlainTextResponse(
@@ -166,4 +216,4 @@ def stats(user: User = Depends(get_user)):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app)
+    uvicorn.run("main:app", reload=True)

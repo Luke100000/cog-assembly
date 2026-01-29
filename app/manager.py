@@ -84,19 +84,23 @@ class ServiceConfig:
     environment: Dict[str, str] = field(default_factory=dict)
     cpuset_cpus: Optional[str] = None
 
+    # Permission group required to access this service (empty = public)
+    required_group: str = ""
+
 
 @dataclass
 class User:
     token: str = uuid.uuid4().hex
-    can_access_logs: bool = False
-    can_access_stats: bool = False
-    whitelist: List[str] = field(default_factory=list)
+    groups: List[str] = field(default_factory=list)
+
+    def has_group(self, group: str) -> bool:
+        """Check if user has a specific permission group. Admin has access to everything."""
+        return "admin" in self.groups or group in self.groups
 
 
 @dataclass
 class ManagerSettings:
     update_interval: float = 5.0
-    users: Dict[str, User] = field(default_factory=dict)
     services: Dict[str, ServiceConfig] = field(default_factory=dict)
 
 
@@ -211,7 +215,6 @@ class ServiceManager:
         self.lock = threading.Lock()
 
         self.config: ManagerSettings = ManagerSettings()
-        self.tokens: dict[str, str] = {}
         self.services: dict[str, Service] = {}
 
         # Define container configurations
@@ -606,12 +609,6 @@ class ServiceManager:
                         yaml.safe_load(file),
                         config=Config(cast=[Enum]),
                     )
-
-                    self.tokens = {
-                        user.token: name for name, user in self.config.users.items()
-                    }
-                    if len(self.tokens) != len(self.config.users):
-                        self.logger.warning("Duplicate user tokens detected!")
 
                     # Shutdown all containers and mark for full re-initialization
                     for name in list(self.services.keys()):

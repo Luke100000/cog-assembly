@@ -1,12 +1,8 @@
 # The time between updates (container shutdowns, VRAM health checks, config reloads, ...)
 update_interval: 5
 
-users:
-  default:
-    token: anonymous
-    can_access_logs: true
-    can_access_stats: true
-    whitelist: []
+# Note: Users are now managed in the database via /admin panel
+# Default admin user (username: admin, password: admin) is created on first startup
 
 services:
   blip:
@@ -16,6 +12,7 @@ services:
     use_gpu: true
     use_cpu: false
     idle_timeout: 3600
+    required_group: ""  # Empty = public endpoint, anyone can access
     health_check:
       mode: "log"
       regex: "Uvicorn running on"
